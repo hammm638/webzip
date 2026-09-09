@@ -1,1 +1,109 @@
+name: Build APK (WebToApk / ZipToApk)
 
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode build: web atau zip"
+        required: true
+        default: "web"
+        type: choice
+        options:
+          - web
+          - zip
+      web_url:
+        description: "URL website (dipakai jika mode = web)"
+        required: false
+        default: "https://flutter.dev"
+      zip_url:
+        description: "URL file .zip berisi index.html+assets (dipakai jika mode = zip). Bisa juga link raw dari repo/release."
+        required: false
+        default: ""
+      app_name:
+        description: "Nama aplikasi (label APK)"
+        required: false
+        default: "MyWebApp"
+      build_type:
+        description: "Tipe build yang dibuat"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - debug
+          - release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.0"
+          channel: "stable"
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # ===== Jika mode = zip, download & extract ke assets/web =====
+      - name: Download & extract ZIP (mode zip)
+        if: ${{ github.event.inputs.mode == 'zip' }}
+        run: |
+          mkdir -p assets/web
+          if [ -n "${{ github.event.inputs.zip_url }}" ]; then
+            curl -L \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/octet-stream" \
+              "${{ github.event.inputs.zip_url }}" -o site.zip
+            unzip -o site.zip -d assets/web
+          else
+            echo "zip_url kosong, pastikan file sudah ada manual di assets/web/"
+          fi
+          ls -la assets/web
+
+      # ===== Set nama aplikasi (opsional, edit AndroidManifest) =====
+      - name: Set app label
+        run: |
+          sed -i "s/android:label=\"[^\"]*\"/android:label=\"${{ github.event.inputs.app_name }}\"/" android/app/src/main/AndroidManifest.xml || true
+
+      - name: Build APK DEBUG
+        if: ${{ github.event.inputs.build_type != 'release' }}
+        run: |
+          flutter build apk --debug \
+            --dart-define=MODE=${{ github.event.inputs.mode }} \
+            --dart-define=WEB_URL="${{ github.event.inputs.web_url }}" \
+            --dart-define=ZIP_INDEX=assets/web/index.html
+
+      - name: Build APK RELEASE
+        if: ${{ github.event.inputs.build_type != 'debug' }}
+        run: |
+          flutter build apk --release \
+            --dart-define=MODE=${{ github.event.inputs.mode }} \
+            --dart-define=WEB_URL="${{ github.event.inputs.web_url }}" \
+            --dart-define=ZIP_INDEX=assets/web/index.html
+
+      - name: Upload APK Debug
+        if: ${{ github.event.inputs.build_type != 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+
+      - name: Upload APK Release
+        if: ${{ github.event.inputs.build_type != 'debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
