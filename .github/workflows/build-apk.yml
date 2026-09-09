@@ -1,0 +1,323 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Jenis build'
+        required: true
+        default: apk-release
+        type: choice
+        options:
+          - apk-release
+          - apk-debug
+          - aab-release
+      flutter_version:
+        description: 'Flutter version (kosong = stable)'
+        required: false
+        default: ''
+        type: string
+      release_tag:
+        description: 'GitHub Release tag yang berisi ZIP project'
+        required: true
+        type: string
+      dependency_mode:
+        description: 'Metode dependency Flutter'
+        required: true
+        default: original
+        type: choice
+        options:
+          - original
+          - upgrade
+          - major
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+  PUB_ENVIRONMENT: bot-web2apk-ci
+
+jobs:
+  build:
+    name: Flutter ${{ inputs.build_type }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Initialize diagnostic log
+        run: |
+          set -e
+          : > "$GITHUB_WORKSPACE/build-debug.log"
+          echo "=== FLUTTER BUILD DEBUG LOG ===" >> "$GITHUB_WORKSPACE/build-debug.log"
+          echo "Started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_WORKSPACE/build-debug.log"
+          echo "Build type: ${{ inputs.build_type }}" >> "$GITHUB_WORKSPACE/build-debug.log"
+          echo "Dependency mode: ${{ inputs.dependency_mode }}" >> "$GITHUB_WORKSPACE/build-debug.log"
+          echo "Flutter input: ${{ inputs.flutter_version || 'stable' }}" >> "$GITHUB_WORKSPACE/build-debug.log"
+
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager --list_installed | grep -E 'platform-tools|platforms;android-34|build-tools;34.0.0' || true
+
+      # Flutter setup dibuat dengan fallback manual. Jika flutter-action gagal/bermasalah,
+      # runner tetap memasang Flutter sehingga tidak berakhir dengan "flutter: command not found".
+      - name: Setup Flutter (primary)
+        continue-on-error: true
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Ensure Flutter is installed (fallback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+          echo '=== ENSURE FLUTTER ==='
+          if command -v flutter >/dev/null 2>&1; then
+            echo "Flutter already available: $(command -v flutter)"
+            flutter --version || true
+          else
+            echo 'flutter tidak tersedia dari flutter-action. Memasang Flutter manual...'
+            FLUTTER_HOME="$RUNNER_TEMP/flutter"
+            rm -rf "$FLUTTER_HOME"
+            git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$FLUTTER_HOME"
+            echo "$FLUTTER_HOME/bin" >> "$GITHUB_PATH"
+            export PATH="$FLUTTER_HOME/bin:$PATH"
+            flutter precache --android
+            flutter config --no-analytics
+            flutter --version
+          fi
+
+          # Pastikan PATH tetap tersedia untuk semua step berikutnya.
+          FLUTTER_BIN="$(command -v flutter 2>/dev/null || true)"
+          if [ -z "$FLUTTER_BIN" ]; then
+            echo 'ERROR: Flutter gagal dipasang.'
+            exit 1
+          fi
+          echo "Flutter binary: $FLUTTER_BIN"
+          echo "Flutter directory: $(dirname "$(dirname "$FLUTTER_BIN")")"
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+          java -version
+          flutter --version
+          flutter doctor -v || true
+          flutter config --no-analytics
+
+      - name: Download project ZIP from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+          rm -rf incoming project
+          mkdir -p incoming project
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zip' \
+            --dir incoming \
+            --clobber
+
+          mapfile -t ZIP_FILES < <(find incoming -maxdepth 1 -type f -iname '*.zip' -print)
+          if [ "${#ZIP_FILES[@]}" -ne 1 ]; then
+            echo "ERROR: Release harus memiliki tepat 1 file ZIP project. Ditemukan: ${#ZIP_FILES[@]}"
+            printf '%s\n' "${ZIP_FILES[@]}"
+            exit 1
+          fi
+
+          ZIP_FILE="${ZIP_FILES[0]}"
+          echo "Using ZIP: $ZIP_FILE"
+          unzip -t "$ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d project
+
+      - name: Locate and validate Flutter project
+        id: flutter_project
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+
+          mapfile -t PUBSPECS < <(find project -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -print)
+          if [ "${#PUBSPECS[@]}" -eq 0 ]; then
+            echo 'ERROR: pubspec.yaml tidak ditemukan di ZIP.'
+            find project -maxdepth 4 -type f | sort | head -200
+            exit 1
+          fi
+          if [ "${#PUBSPECS[@]}" -gt 1 ]; then
+            echo 'ERROR: Ditemukan lebih dari satu pubspec.yaml. ZIP harus berisi satu Flutter project.'
+            printf '%s\n' "${PUBSPECS[@]}"
+            exit 1
+          fi
+
+          PUBSPEC="${PUBSPECS[0]}"
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          test -f "$PROJECT_DIR/pubspec.yaml"
+          test -d "$PROJECT_DIR/android" || { echo 'ERROR: folder android tidak ditemukan.'; exit 1; }
+          test -f "$PROJECT_DIR/android/gradlew" || { echo 'ERROR: android/gradlew tidak ditemukan.'; exit 1; }
+          chmod +x "$PROJECT_DIR/android/gradlew"
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Flutter project: $PROJECT_DIR"
+          echo '--- pubspec.yaml ---'
+          sed -n '1,240p' "$PROJECT_DIR/pubspec.yaml"
+
+      - name: Resolve Flutter dependencies
+        working-directory: ${{ steps.flutter_project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+
+          echo "Dependency mode: ${{ inputs.dependency_mode }}"
+          flutter clean
+          rm -rf .dart_tool
+
+          case "${{ inputs.dependency_mode }}" in
+            original)
+              flutter pub get
+              ;;
+            upgrade)
+              flutter pub upgrade
+              ;;
+            major)
+              flutter pub upgrade --major-versions
+              ;;
+            *)
+              echo 'ERROR: dependency_mode tidak valid.'
+              exit 1
+              ;;
+          esac
+
+          test -f pubspec.lock || echo 'WARNING: pubspec.lock tidak dibuat oleh Pub.'
+          flutter pub deps --style=compact || true
+
+      - name: Build Flutter artifact with one clean retry
+        id: flutter_build
+        working-directory: ${{ steps.flutter_project.outputs.dir }}
+        run: |
+          set -u
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+
+          BUILD_TYPE='${{ inputs.build_type }}'
+          BUILD_ARGS=()
+          OUTPUT_FILE=''
+
+          case "$BUILD_TYPE" in
+            apk-release)
+              BUILD_ARGS=(build apk --release --no-tree-shake-icons)
+              OUTPUT_FILE='build/app/outputs/flutter-apk/app-release.apk'
+              ;;
+            apk-debug)
+              BUILD_ARGS=(build apk --debug)
+              OUTPUT_FILE='build/app/outputs/flutter-apk/app-debug.apk'
+              ;;
+            aab-release)
+              BUILD_ARGS=(build appbundle --release --no-tree-shake-icons)
+              OUTPUT_FILE='build/app/outputs/bundle/release/app-release.aab'
+              ;;
+            *)
+              echo "ERROR: Build type tidak valid: $BUILD_TYPE"
+              exit 1
+              ;;
+          esac
+
+          build_once() {
+            echo "=== BUILD ATTEMPT $1 ==="
+            flutter build "${BUILD_ARGS[@]}"
+          }
+
+          if ! build_once 1; then
+            echo '⚠️ Build pertama gagal. Menjalankan recovery sekali...'
+            flutter clean || true
+            rm -rf .dart_tool build android/.gradle android/app/build android/build
+            flutter pub get
+            if ! build_once 2; then
+              echo 'ERROR: Build gagal setelah recovery retry.'
+              exit 1
+            fi
+          fi
+
+          test -s "$OUTPUT_FILE" || { echo "ERROR: Output tidak ditemukan atau kosong: $OUTPUT_FILE"; exit 1; }
+          echo "Build output: $OUTPUT_FILE"
+          ls -lh "$OUTPUT_FILE"
+
+      - name: Generate failure diagnostics
+        if: failure()
+        working-directory: ${{ steps.flutter_project.outputs.dir }}
+        run: |
+          set +e
+          exec >> "$GITHUB_WORKSPACE/build-debug.log" 2>&1
+          echo
+          echo '=== FAILURE DIAGNOSTICS ==='
+          java -version
+          if command -v flutter >/dev/null 2>&1; then
+            flutter --version
+            flutter doctor -v
+            flutter pub deps --style=compact
+          else
+            echo 'Flutter binary tidak tersedia; diagnostics Flutter dilewati agar error asli tetap terlihat.'
+          fi
+          echo '--- pubspec.lock head ---'
+          test -f pubspec.lock && sed -n '1,180p' pubspec.lock || true
+          echo '--- Android Gradle files ---'
+          find android -maxdepth 3 -type f \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle-wrapper.properties' \) -print -exec sed -n '1,220p' {} \; 2>/dev/null || true
+
+      - name: Upload debug build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-debug-log-${{ inputs.build_type }}
+          path: ${{ github.workspace }}/build-debug.log
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+      - name: Collect APK/AAB
+        if: success()
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build-debug.log") 2>&1
+          mkdir -p artifacts
+          case "${{ inputs.build_type }}" in
+            apk-release)
+              cp "${{ steps.flutter_project.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk" artifacts/app-release.apk
+              ;;
+            apk-debug)
+              cp "${{ steps.flutter_project.outputs.dir }}/build/app/outputs/flutter-apk/app-debug.apk" artifacts/app-debug.apk
+              ;;
+            aab-release)
+              cp "${{ steps.flutter_project.outputs.dir }}/build/app/outputs/bundle/release/app-release.aab" artifacts/app-release.aab
+              ;;
+          esac
+          test -s artifacts/*
+          ls -lh artifacts
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_type }}-build
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
