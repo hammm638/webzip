@@ -1,0 +1,384 @@
+name: Web to APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: 'URL Website'
+        required: true
+        type: string
+      app_name:
+        description: 'Nama Aplikasi'
+        required: true
+        type: string
+      icon_url:
+        description: 'URL Icon (PNG/JPG) - kosongkan untuk default'
+        required: false
+        type: string
+        default: ''
+
+env:
+  APP_NAME: ${{ github.event.inputs.app_name }}
+  WEB_URL: ${{ github.event.inputs.web_url }}
+  ICON_URL: ${{ github.event.inputs.icon_url }}
+  PACKAGE_NAME: com.web2apk.build${{ github.run_number }}
+
+jobs:
+  build:
+    name: Build Web to APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 🤖 Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0'
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 📦 Install Dependencies
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pil file
+
+      - name: 🖼️ Download & Prepare App Icon
+        run: |
+          set -e
+          mkdir -p assets res/icon/android
+          rm -f assets/icon_source assets/icon_original.png
+          echo "📥 Icon URL: $ICON_URL"
+
+          if [ -n "$ICON_URL" ]; then
+            curl -fL --retry 3 --connect-timeout 15 --max-time 60 \
+              -A "Mozilla/5.0" "$ICON_URL" -o assets/icon_source || true
+          fi
+
+          if [ ! -s assets/icon_source ]; then
+            echo "⚠️ Icon download failed; generating safe default icon"
+            python3 - <<'PYICON'
+          from PIL import Image, ImageDraw, ImageFont
+          img = Image.new("RGBA", (512, 512), (108, 92, 231, 255))
+          d = ImageDraw.Draw(img)
+          text = "APK"
+          try:
+              font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 120)
+          except Exception:
+              font = ImageFont.load_default()
+          b = d.textbbox((0, 0), text, font=font)
+          d.text(((512-(b[2]-b[0]))/2, (512-(b[3]-b[1]))/2-10), text,
+                  fill=(255,255,255,255), font=font)
+          img.save("assets/icon_source", "PNG", optimize=True)
+          PYICON
+          fi
+
+          # Preserve the user's artwork. Only decode and re-encode to a clean
+          # RGBA PNG so Android AAPT can compile it reliably.
+          python3 - <<'PYICONPREP'
+          from PIL import Image, ImageOps
+          from pathlib import Path
+          src = Path("assets/icon_source")
+          out = Path("assets/icon_original.png")
+          try:
+              img = Image.open(src)
+              img = ImageOps.exif_transpose(img)
+              img.load()
+          except Exception as e:
+              print(f"❌ Invalid icon: {e}")
+              raise SystemExit(1)
+          img = img.convert("RGBA")
+          img.save(out, "PNG", optimize=True)
+          print(f"✅ User icon preserved: {img.width}x{img.height} RGBA PNG")
+          PYICONPREP
+
+          python3 - <<'PYICONS'
+          from PIL import Image
+          src = Image.open("assets/icon_original.png").convert("RGBA")
+          # Fit proportionally. No crop and no forced stretch.
+          for size in (48, 72, 96, 144, 192):
+              im = src.copy()
+              im.thumbnail((size, size), Image.Resampling.LANCZOS)
+              canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              canvas.alpha_composite(im, ((size-im.width)//2, (size-im.height)//2))
+              canvas.save(f"res/icon/android/icon-{size}.png", "PNG", optimize=True)
+          Image.open("assets/icon_original.png").save("res/icon/icon.png", "PNG", optimize=True)
+          print("✅ Android icons generated without crop/stretch")
+          PYICONS
+
+          python3 - <<'PYVERIFY'
+          from PIL import Image
+          from pathlib import Path
+          files = [Path("assets/icon_original.png")] + sorted(Path("res/icon/android").glob("icon-*.png"))
+          for p in files:
+              with Image.open(p) as im:
+                  im.verify()
+              print(f"✅ valid PNG: {p}")
+          PYVERIFY
+
+      - name: 🌐 Create WebView App
+        run: |
+          mkdir -p web2apk-project
+          cd web2apk-project
+          mkdir -p app/src/main/java/com/web2apk/app
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-hdpi
+          mkdir -p app/src/main/res/mipmap-mdpi
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          mkdir -p app/src/main/res/mipmap-xxhdpi
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          mkdir -p app/src/main/res/xml
+          mkdir -p gradle/wrapper
+
+      - name: 📋 Create AndroidManifest.xml
+        run: |
+          cat > web2apk-project/app/src/main/AndroidManifest.xml << 'MANIFEST_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="${{ env.APP_NAME }}"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name="com.web2apk.app.MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          MANIFEST_EOF
+          echo "✅ AndroidManifest.xml created"
+
+      - name: 📝 Create MainActivity.java
+        run: |
+          cat > web2apk-project/app/src/main/java/com/web2apk/app/MainActivity.java << 'JAVA_EOF'
+          package com.web2apk.app;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebChromeClient;
+          import android.view.Window;
+          import android.view.WindowManager;
+          public class MainActivity extends Activity {
+              private WebView webView;
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+                  webView = new WebView(this);
+                  setContentView(webView);
+                  WebSettings webSettings = webView.getSettings();
+                  webSettings.setJavaScriptEnabled(true);
+                  webSettings.setDomStorageEnabled(true);
+                  webSettings.setAllowFileAccess(true);
+                  webSettings.setLoadWithOverviewMode(true);
+                  webSettings.setUseWideViewPort(true);
+                  webSettings.setSupportZoom(true);
+                  webSettings.setBuiltInZoomControls(true);
+                  webSettings.setDisplayZoomControls(false);
+                  webSettings.setCacheMode(WebSettings.LOAD_DEFAULT);
+                  webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                          view.loadUrl(url);
+                          return true;
+                      }
+                  });
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.loadUrl("${{ env.WEB_URL }}");
+              }
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) { webView.goBack(); }
+                  else { super.onBackPressed(); }
+              }
+          }
+          JAVA_EOF
+          echo "✅ MainActivity.java created"
+
+      - name: 📐 Create Layout
+        run: |
+          cat > web2apk-project/app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <WebView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/webview"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent" />
+          EOF
+          echo "✅ Layout created"
+
+      - name: 🎨 Create Styles
+        run: |
+          cat > web2apk-project/app/src/main/res/values/styles.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:statusBarColor">#6C5CE7</item>
+                  <item name="android:navigationBarColor">#6C5CE7</item>
+              </style>
+          </resources>
+          EOF
+          cat > web2apk-project/app/src/main/res/values/colors.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="colorPrimary">#6C5CE7</color>
+              <color name="colorPrimaryDark">#5A4BD1</color>
+              <color name="colorAccent">#00CEC9</color>
+          </resources>
+          EOF
+          echo "✅ Styles created"
+
+      - name: 🔧 Create build.gradle
+        run: |
+          cat > web2apk-project/build.gradle << 'EOF'
+          buildscript {
+              repositories { google(); mavenCentral() }
+              dependencies { classpath 'com.android.tools.build:gradle:8.2.0' }
+          }
+          EOF
+          cat > web2apk-project/app/build.gradle << 'EOF'
+          apply plugin: 'com.android.application'
+          android {
+              namespace '${{ env.PACKAGE_NAME }}'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "${{ env.PACKAGE_NAME }}"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode ${{ github.run_number }}
+                  versionName "1.0"
+              }
+              buildTypes {
+                debug { minifyEnabled false }
+                release { minifyEnabled false }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies { implementation 'androidx.appcompat:appcompat:1.6.1' }
+          EOF
+          echo "✅ build.gradle created"
+
+      - name: ⚙️ Create settings.gradle
+        run: |
+          cat > web2apk-project/settings.gradle << 'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.PREFER_PROJECT); repositories { google(); mavenCentral() } }
+          rootProject.name = 'Web2APK'
+          include ':app'
+          EOF
+          echo "✅ settings.gradle created"
+
+      - name: 📝 Create gradle.properties
+        run: |
+          cat > web2apk-project/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+          echo "✅ gradle.properties created"
+
+      - name: 📦 Setup Gradle Wrapper
+        run: |
+          cd web2apk-project
+          mkdir -p gradle/wrapper
+          curl -s -L -o gradle/wrapper/gradle-wrapper.jar "https://raw.githubusercontent.com/gradle/gradle/v8.5.0/gradle/wrapper/gradle-wrapper.jar"
+          cat > gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.5-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          curl -s -L -o gradlew "https://raw.githubusercontent.com/gradle/gradle/v8.5.0/gradlew"
+          chmod +x gradlew
+          echo "✅ Gradle wrapper ready"
+
+      - name: 🖼️ Copy & Validate Icons
+        run: |
+          set -e
+          RES="web2apk-project/app/src/main/res"
+
+          cp res/icon/android/icon-48.png  "$RES/mipmap-mdpi/ic_launcher.png"
+          cp res/icon/android/icon-72.png  "$RES/mipmap-hdpi/ic_launcher.png"
+          cp res/icon/android/icon-96.png  "$RES/mipmap-xhdpi/ic_launcher.png"
+          cp res/icon/android/icon-144.png "$RES/mipmap-xxhdpi/ic_launcher.png"
+          cp res/icon/android/icon-192.png "$RES/mipmap-xxxhdpi/ic_launcher.png"
+
+          echo "🔍 Validating all launcher icons..."
+          for dir in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            FILE="$RES/$dir/ic_launcher.png"
+            test -s "$FILE"
+            python3 -c "from PIL import Image; Image.open('$FILE').verify()"
+            file "$FILE"
+          done
+          echo "✅ All launcher icons are valid PNG files"
+
+      - name: 🔨 Build APK
+        run: |
+          cd web2apk-project
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon 2>&1 | tee /tmp/build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "❌ BUILD FAILED"
+            tail -80 /tmp/build.log
+            exit 1
+          fi
+          echo "✅ Build success!"
+
+      - name: 📱 Rename APK
+        run: |
+          APK_FILE=$(find web2apk-project -name "*.apk" -type f | head -1)
+          if [ -z "$APK_FILE" ]; then echo "❌ No APK found!"; exit 1; fi
+          CLEAN_NAME=$(echo "${{ env.APP_NAME }}" | sed 's/[^a-zA-Z0-9]/_/g')
+          APK_NAME="${CLEAN_NAME}_web2apk.apk"
+          cp "$APK_FILE" "./$APK_NAME"
+          echo "✅ APK: $APK_NAME"
+
+      - name: 📤 Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Web2APK-${{ env.APP_NAME }}
+          path: ./*.apk
+          retention-days: 7
+
+      - name: 📊 Build Summary
+        run: |
+          APK_FILE=$(find . -name "*.apk" -type f -not -path "*/build/*" | head -1)
+          echo "🎉 BUILD COMPLETE!"
+          echo "📱 ${{ env.APP_NAME }}"
+          echo "🌐 ${{ env.WEB_URL }}"
+          ls -lh "$APK_FILE"
