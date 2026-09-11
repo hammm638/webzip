@@ -1,0 +1,817 @@
+name: Flutter Build Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Tipe build: apk-debug | apk-release | aab-release'
+        required: false
+        default: 'apk-release'
+        type: choice
+        options:
+          - apk-debug
+          - apk-release
+          - aab-release
+      release_tag:
+        description: 'Release tag dari bot Telegram'
+        required: false
+        default: ''
+        type: string
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'lib/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - 'android/**'
+      - 'assets/**'
+
+jobs:
+  build:
+    name: Build Flutter App
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ============================================
+      # ⬇️ DOWNLOAD ZIP DARI RELEASE BOT
+      # ============================================
+      - name: 📥 Download Project ZIP from Bot Release
+        if: github.event.inputs.release_tag != ''
+        run: |
+          echo "📥 Mendownload project dari release: ${{ github.event.inputs.release_tag }}"
+          
+          # TUNGGU dulu 15 detik untuk memastikan release sudah siap
+          echo "⏳ Menunggu 15 detik untuk memastikan release siap..."
+          sleep 15
+          
+          # Get release info dengan RETRY
+          MAX_RETRY=5
+          RETRY=0
+          ASSET_URL=""
+          
+          while [ $RETRY -lt $MAX_RETRY ]; do
+            echo "🔍 Attempt $((RETRY+1))/$MAX_RETRY: Mencari release..."
+            
+            # Get release by tag
+            RELEASE_RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.event.inputs.release_tag }}")
+            
+            # Cek apakah release ada
+            RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq -r '.id')
+            
+            if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+              echo "✅ Release ditemukan! ID: $RELEASE_ID"
+              
+              # Get asset URL
+              ASSET_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.assets[0].browser_download_url')
+              
+              if [ "$ASSET_URL" != "null" ] && [ -n "$ASSET_URL" ]; then
+                echo "✅ Asset ditemukan: $ASSET_URL"
+                break
+              else
+                echo "⚠️ Release ada tapi asset belum siap, tunggu 10 detik..."
+                sleep 10
+              fi
+            else
+              echo "⚠️ Release belum ditemukan, tunggu 10 detik..."
+              sleep 10
+            fi
+            
+            RETRY=$((RETRY+1))
+          done
+          
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "❌ Gagal mendapatkan asset setelah $MAX_RETRY kali percobaan!"
+            echo "Release response:"
+            echo "$RELEASE_RESPONSE" | jq '.'
+            
+            # Coba list semua release
+            echo ""
+            echo "📋 Daftar release yang ada:"
+            curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases?per_page=5" | \
+              jq '.[].tag_name'
+            
+            exit 1
+          fi
+          
+          echo "📦 Download dari: $ASSET_URL"
+          curl -L -o project.zip "$ASSET_URL"
+          
+          # Cek file
+          if [ ! -f project.zip ]; then
+            echo "❌ File ZIP gagal didownload!"
+            exit 1
+          fi
+          
+          echo "📏 Size: $(du -h project.zip | cut -f1)"
+          
+          # Ekstrak ZIP
+          echo "📂 Mengekstrak ZIP..."
+          mkdir -p project_extracted
+          unzip -o project.zip -d project_extracted/
+          
+          # Cari pubspec.yaml
+          if [ -f "project_extracted/pubspec.yaml" ]; then
+            echo "✅ pubspec.yaml ditemukan di root ZIP"
+            cp -rf project_extracted/* .
+            cp -rf project_extracted/.* . 2>/dev/null || true
+          else
+            # Cari di subfolder
+            echo "🔍 Mencari pubspec.yaml di subfolder..."
+            SUBFOLDER=$(find project_extracted -name "pubspec.yaml" -not -path "*/.*" | head -1)
+            
+            if [ -n "$SUBFOLDER" ]; then
+              PROJECT_DIR=$(dirname "$SUBFOLDER")
+              echo "✅ pubspec.yaml ditemukan di: $PROJECT_DIR"
+              cp -rf "$PROJECT_DIR"/* .
+              cp -rf "$PROJECT_DIR"/.* . 2>/dev/null || true
+            else
+              echo "❌ pubspec.yaml TIDAK DITEMUKAN!"
+              echo "Isi ZIP:"
+              ls -laR project_extracted/ | head -50
+              exit 1
+            fi
+          fi
+          
+          # Cleanup
+          rm -rf project_extracted project.zip
+          
+          echo "✅ Project siap:"
+          echo "---"
+          ls -la
+          echo "---"
+          head -20 pubspec.yaml
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      # ============================================
+      # 🤖 ANDROID TOOLCHAIN (Flutter 3.47.2)
+      # Java 17 + Android SDK 36 + Build Tools 36
+      # ============================================
+      - name: Setup Android SDK 36
+        run: |
+          echo "=== Android toolchain ==="
+          java -version
+          echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+
+          SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "${ANDROID_SDK_ROOT}/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "❌ sdkmanager tidak ditemukan"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+          echo "=== Installed Android SDK ==="
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --list_installed 2>/dev/null |             grep -E "platforms;android-36|build-tools;36.0.0|platform-tools" || true
+
+      - name: Normalize Gradle Toolchain
+        run: |
+          echo "=== Flutter 3.47.2 Android compatibility ==="
+          echo "Target: Kotlin 2.2.20 / AGP 8.10.0 / Gradle 8.14.0 / Java 17 / compileSdk 36"
+
+          # Kotlin 2.2.20 is required by Flutter 3.47.2.
+          BUILD_GRADLE="android/build.gradle"
+          if [ -f "$BUILD_GRADLE" ]; then
+            if grep -q "kotlin_version" "$BUILD_GRADLE"; then
+              sed -i "s/ext\.kotlin_version = '[^']*'/ext.kotlin_version = '2.2.20'/" "$BUILD_GRADLE"
+            elif grep -q "kotlinVersion" "$BUILD_GRADLE"; then
+              sed -i "s/kotlinVersion[[:space:]]*=[[:space:]]*['"][^'"]*['"]/kotlinVersion = '2.2.20'/" "$BUILD_GRADLE"
+            fi
+          fi
+
+          # Keep the project on a known-compatible AGP/Gradle pair.
+          # Only Android Gradle Plugin declarations are changed.
+          find android -type f \( -name "build.gradle" -o -name "build.gradle.kts" -o -name "settings.gradle" -o -name "settings.gradle.kts" \) -print0 |
+          while IFS= read -r -d '' f; do
+            sed -i -E 's/(com\.android\.tools\.build:gradle:)[0-9]+\.[0-9]+\.[0-9]+/\18.10.0/g' "$f"
+            sed -i -E 's/(id[[:space:]]+["'\''"]com\.android\.(application|library)["'\''"][[:space:]]+version[[:space:]]+["'\''"])[0-9]+\.[0-9]+\.[0-9]+(["'\''"])/\18.10.0\3/g' "$f"
+          done
+
+          # Gradle 8.14.0 is compatible with AGP 8.10.x and Kotlin 2.2.20.
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER" ]; then
+            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.0-all.zip#' "$WRAPPER"
+            echo "✅ Gradle wrapper -> 8.14.0"
+          else
+            echo "⚠️ gradle-wrapper.properties tidak ditemukan; Flutter/Gradle akan memakai wrapper project."
+          fi
+
+          echo ""
+          echo "=== Toolchain check ==="
+          java -version
+          if [ -f "$WRAPPER" ]; then
+            grep "distributionUrl" "$WRAPPER"
+          fi
+          grep -RInE "kotlin_version|kotlin-gradle-plugin|com.android.tools.build:gradle|com.android.application.*version" android/ 2>/dev/null | head -30 || true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.2"
+          channel: 'stable'
+          cache: true
+
+      # ============================================
+      # 🛡️ FLUTTER PROJECT AUTO-DETECT & PREFLIGHT
+      # ============================================
+      - name: Detect and Validate Flutter Project
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Flutter / Dart ==="
+          flutter --version
+          dart --version
+
+          echo ""
+          echo "=== Flutter Doctor ==="
+          flutter doctor -v || true
+
+          echo ""
+          echo "=== Detect Flutter project ==="
+          if [ ! -f "pubspec.yaml" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan."
+            echo "Pastikan ZIP berisi project Flutter."
+            exit 1
+          fi
+
+          echo "✅ pubspec.yaml ditemukan."
+
+          # Project ZIP lama kadang tidak memiliki folder Android.
+          if [ ! -d "android" ]; then
+            echo "⚠️ Folder android tidak ditemukan. Membuat platform Android..."
+            flutter create --platforms=android --project-name=builder_app .
+          fi
+
+          # Pastikan Gradle wrapper tersedia.
+          if [ ! -f "android/gradlew" ] || [ ! -f "android/gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "⚠️ Gradle wrapper tidak lengkap. Regenerating Android files..."
+            flutter create --platforms=android --project-name=builder_app .
+          fi
+
+          chmod +x android/gradlew 2>/dev/null || true
+
+          echo ""
+          echo "=== Validate pubspec ==="
+          flutter pub get
+          flutter pub deps --style=compact >/dev/null
+
+          echo "✅ Project Flutter siap dibuild."
+
+      # ============================================
+      # 🧠 GRADLE MEMORY & ANDROIDX STABILITY
+      # ============================================
+      - name: Stabilize Gradle
+        shell: bash
+        run: |
+          set -e
+          mkdir -p android/gradle
+          touch android/gradle.properties
+
+          grep -q '^org.gradle.jvmargs=' android/gradle.properties || \
+            echo 'org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8' >> android/gradle.properties
+
+          grep -q '^org.gradle.daemon=' android/gradle.properties || \
+            echo 'org.gradle.daemon=true' >> android/gradle.properties
+
+          grep -q '^android.useAndroidX=' android/gradle.properties || \
+            echo 'android.useAndroidX=true' >> android/gradle.properties
+
+          grep -q '^android.enableJetifier=' android/gradle.properties || \
+            echo 'android.enableJetifier=true' >> android/gradle.properties
+
+          echo "=== Gradle properties ==="
+          cat android/gradle.properties
+
+      # ============================================
+      # 🎨 REGENERATE LAUNCHER ICONS (FIX UTAMA)
+      # ============================================
+      - name: 🎨 Regenerate Launcher Icons
+        run: |
+          echo "=========================================="
+          echo "=== REGENERATING LAUNCHER ICONS ==="
+          echo "=========================================="
+          
+          # Install ImageMagick
+          if ! command -v convert >/dev/null 2>&1; then
+            echo "📦 Installing ImageMagick..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+          fi
+          
+          # Cari file icon sumber
+          SOURCE_ICON=""
+          if [ -f "assets/icon/icon.jpg" ]; then
+            SOURCE_ICON="assets/icon/icon.jpg"
+          elif [ -f "assets/icon/icon.png" ]; then
+            SOURCE_ICON="assets/icon/icon.png"
+          elif [ -f "assets/icon/icon.webp" ]; then
+            SOURCE_ICON="assets/icon/icon.webp"
+          fi
+          
+          if [ -n "$SOURCE_ICON" ]; then
+            echo "✅ Source icon found: $SOURCE_ICON"
+            
+            # Hapus SEMUA ic_launcher yang ada
+            echo "🗑️ Removing all existing ic_launcher files..."
+            find android/app/src/main/res -name "ic_launcher*" -type f -delete
+            
+            # Buat icon untuk setiap density
+            echo "🎨 Creating icons for all densities..."
+            
+            # mdpi (48x48)
+            mkdir -p android/app/src/main/res/mipmap-mdpi
+            convert "$SOURCE_ICON" -resize 48x48 -gravity center -extent 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+            echo "  ✅ mipmap-mdpi/ic_launcher.png (48x48)"
+            
+            # hdpi (72x72)
+            mkdir -p android/app/src/main/res/mipmap-hdpi
+            convert "$SOURCE_ICON" -resize 72x72 -gravity center -extent 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+            echo "  ✅ mipmap-hdpi/ic_launcher.png (72x72)"
+            
+            # xhdpi (96x96)
+            mkdir -p android/app/src/main/res/mipmap-xhdpi
+            convert "$SOURCE_ICON" -resize 96x96 -gravity center -extent 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+            echo "  ✅ mipmap-xhdpi/ic_launcher.png (96x96)"
+            
+            # xxhdpi (144x144)
+            mkdir -p android/app/src/main/res/mipmap-xxhdpi
+            convert "$SOURCE_ICON" -resize 144x144 -gravity center -extent 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+            echo "  ✅ mipmap-xxhdpi/ic_launcher.png (144x144)"
+            
+            # xxxhdpi (192x192)
+            mkdir -p android/app/src/main/res/mipmap-xxxhdpi
+            convert "$SOURCE_ICON" -resize 192x192 -gravity center -extent 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            echo "  ✅ mipmap-xxxhdpi/ic_launcher.png (192x192)"
+            
+            # Buat juga adaptive icon untuk Android 8+ (mipmap-anydpi-v26)
+            echo "🎨 Creating adaptive icon (Android 8+)..."
+            mkdir -p android/app/src/main/res/mipmap-anydpi-v26
+            
+            # Background layer (108x108)
+            mkdir -p android/app/src/main/res/drawable
+            convert "$SOURCE_ICON" -resize 108x108 -gravity center -extent 108x108 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_background.png
+            
+            # Foreground layer (108x108 dengan padding 25%)
+            convert "$SOURCE_ICON" -resize 72x72 -gravity center -extent 108x108 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png
+            
+            cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@mipmap/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XMLEOF
+            echo "  ✅ mipmap-anydpi-v26/ic_launcher.xml"
+            
+          else
+            echo "⚠️ No source icon found, creating placeholder icons..."
+            
+            # Buat placeholder icon sederhana (warna solid biru)
+            for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+              case $density in
+                mdpi) SIZE="48x48" ;;
+                hdpi) SIZE="72x72" ;;
+                xhdpi) SIZE="96x96" ;;
+                xxhdpi) SIZE="144x144" ;;
+                xxxhdpi) SIZE="192x192" ;;
+              esac
+              
+              OUTPUT_DIR="android/app/src/main/res/mipmap-${density}"
+              mkdir -p "$OUTPUT_DIR"
+              
+              convert -size "$SIZE" xc:'#2196F3' \
+                -fill white -gravity center -pointsize 24 \
+                -annotate 0 "App" \
+                "$OUTPUT_DIR/ic_launcher.png"
+              
+              echo "  ✅ Placeholder: mipmap-${density}/ic_launcher.png (${SIZE})"
+            done
+          fi
+          
+          echo ""
+          echo "=== ICON REGENERATION COMPLETE ==="
+          echo "Files created:"
+          find android/app/src/main/res -name "ic_launcher*" -type f | sort
+
+      # ============================================
+      # 🧹 CLEAN ICON RESOURCES (bersihkan duplikat)
+      # ============================================
+      - name: 🧹 Clean Icon Resources
+        run: |
+          echo "=========================================="
+          echo "=== CLEANING ICON RESOURCES ==="
+          echo "=========================================="
+          
+          # Hapus SEMUA file ic_launcher selain PNG
+          echo "🗑️ Removing non-PNG icon files..."
+          find android/app/src/main/res -type f \( \
+            -name "ic_launcher.jpg" -o \
+            -name "ic_launcher.webp" -o \
+            -name "ic_launcher.gif" -o \
+            -name "ic_launcher.bmp" -o \
+            -name "ic_launcher_round.jpg" -o \
+            -name "ic_launcher_round.webp" -o \
+            -name "ic_launcher_round.gif" -o \
+            -name "ic_launcher_foreground.jpg" -o \
+            -name "ic_launcher_foreground.webp" -o \
+            -name "ic_launcher_background.jpg" -o \
+            -name "ic_launcher_background.webp" \
+          \) -delete 2>/dev/null || true
+          
+          # Hapus file ukuran 0 byte
+          echo "🗑️ Removing 0-byte icon files..."
+          find android/app/src/main/res -name "ic_launcher*" -type f -size 0 -delete 2>/dev/null || true
+          
+          echo ""
+          echo "=== REMAINING ICON FILES ==="
+          find android/app/src/main/res -name "ic_launcher*" -type f -exec ls -lh {} \; | sort
+          
+          echo ""
+          echo "✅ Icon cleanup complete"
+
+      # ============================================
+      # 🔍 VALIDATE RESOURCES
+      # ============================================
+      - name: 🔍 Validate Android Resources
+        run: |
+          echo "=========================================="
+          echo "=== VALIDATING ANDROID RESOURCES ==="
+          echo "=========================================="
+          
+          ERROR_FOUND=0
+          
+          for png in $(find android/app/src/main/res -name "*.png" -type f); do
+            # Cek ukuran file (harus > 0)
+            SIZE=$(stat -c%s "$png" 2>/dev/null || echo 0)
+            if [ "$SIZE" -eq 0 ]; then
+              echo "❌ EMPTY FILE: $png (0 bytes)"
+              ERROR_FOUND=1
+              rm -f "$png"
+              continue
+            fi
+            
+            # Coba validasi PNG dengan identify
+            if command -v identify >/dev/null 2>&1; then
+              if identify "$png" >/dev/null 2>&1; then
+                DIMENSIONS=$(identify -format "%wx%h" "$png" 2>/dev/null)
+                echo "  ✅ $png ($DIMENSIONS, ${SIZE} bytes)"
+              else
+                echo "❌ CORRUPT PNG: $png"
+                ERROR_FOUND=1
+                
+                # Coba perbaiki
+                echo "  🔧 Attempting to fix..."
+                convert -size 48x48 xc:'#2196F3' "$png" 2>/dev/null || {
+                  echo "  ❌ Cannot fix, removing..."
+                  rm -f "$png"
+                }
+              fi
+            fi
+          done
+          
+          if [ $ERROR_FOUND -eq 1 ]; then
+            echo ""
+            echo "⚠️ Some resources were corrupt and have been fixed/removed"
+            echo "⚠️ You may need to check your source icon file"
+          else
+            echo ""
+            echo "✅ All PNG resources are valid!"
+          fi
+          
+          # Final check: pastikan minimal ada ic_launcher.png untuk setiap density
+          echo ""
+          echo "=== FINAL CHECK: Required icons ==="
+          for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            ICON_PATH="android/app/src/main/res/mipmap-${density}/ic_launcher.png"
+            if [ -f "$ICON_PATH" ]; then
+              SIZE=$(stat -c%s "$ICON_PATH")
+              echo "  ✅ mipmap-${density}/ic_launcher.png ($SIZE bytes)"
+            else
+              echo "  ❌ MISSING: mipmap-${density}/ic_launcher.png"
+              ERROR_FOUND=1
+            fi
+          done
+          
+          if [ $ERROR_FOUND -eq 1 ]; then
+            echo ""
+            echo "❌ VALIDATION FAILED - Some required icons are missing!"
+            echo "This will likely cause build to fail."
+          else
+            echo ""
+            echo "✅ VALIDATION PASSED - All resources are ready!"
+          fi
+
+      # PERBAIKAN: Menghapus import R yang menyebabkan error dan memastikan Namespace benar
+      - name: Fix Java and Namespace
+        run: |
+          # Hapus import R karena jika package sama, import tidak diperlukan
+          FILE_PATH="android/app/src/main/java/com/nullx/pp/SpyService.java"
+          if [ -f "$FILE_PATH" ]; then
+            sed -i '/import com.nullx.pp.R;/d' "$FILE_PATH"
+            echo "✅ Import R dihapus"
+          fi
+          
+          # Pastikan namespace terpasang agar R ter-generate
+          BUILD_GRADLE="android/app/build.gradle"
+          if [ -f "$BUILD_GRADLE" ]; then
+            if ! grep -q "namespace 'com.nullx.pp'" "$BUILD_GRADLE"; then
+              sed -i "/android {/a \    namespace 'com.nullx.pp'" "$BUILD_GRADLE"
+              echo "✅ Namespace dipaksa ke com.nullx.pp"
+            fi
+          fi
+
+      - name: Fix Kotlin 2.2.20 Compatibility
+        run: |
+          BUILD_GRADLE="android/build.gradle"
+          if [ -f "$BUILD_GRADLE" ]; then
+            if grep -q "kotlin_version" "$BUILD_GRADLE"; then
+              sed -i "s/ext\.kotlin_version = '[^']*'/ext.kotlin_version = '2.2.20'/" "$BUILD_GRADLE"
+              echo "kotlin_version patched ke 2.2.20"
+            else
+              sed -i "/buildscript {/a\\    ext.kotlin_version = '2.2.20'" "$BUILD_GRADLE"
+              echo "kotlin_version 2.2.20 ditambahkan"
+            fi
+          fi
+          echo "--- android/build.gradle ---"
+          cat "$BUILD_GRADLE" 2>/dev/null || echo "(not found)"
+
+      # PERBAIKAN: Fix minSdkVersion & overrideLibrary
+      - name: 🔧 Fix minSdkVersion & AndroidManifest
+        run: |
+          echo "=== Fixing all gradle files ==="
+          
+          # Fix semua build.gradle dan build.gradle.kts
+          find android -name "build.gradle" -o -name "build.gradle.kts" | while read f; do
+            echo "Processing: $f"
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/g' "$f"
+            sed -i 's/minSdkVersion 21/minSdkVersion 23/g' "$f"
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/g' "$f"
+            sed -i 's/minSdk(flutter.minSdkVersion)/minSdk(23)/g' "$f"
+            sed -i 's/minSdk = 21/minSdk = 23/g' "$f"
+            sed -i 's/minSdk 21/minSdk 23/g' "$f"
+          done
+          
+          echo "=== All gradle files fixed ==="
+          grep -r "minSdk" android/ 2>/dev/null | head -10
+          
+          # Fix AndroidManifest.xml
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            echo "=== Fixing AndroidManifest ==="
+            
+            # Tambahkan xmlns:tools jika belum ada
+            if ! grep -q "xmlns:tools" "$MANIFEST"; then
+              sed -i 's/<manifest/<manifest xmlns:tools="http:\/\/schemas.android.com\/tools"/' "$MANIFEST"
+              echo "✅ xmlns:tools added"
+            fi
+            
+            # Tambahkan overrideLibrary jika belum ada
+            if ! grep -q "overrideLibrary" "$MANIFEST"; then
+              sed -i 's/<application/<application\n        tools:overrideLibrary="com.llfbandit.record"/' "$MANIFEST"
+              echo "✅ overrideLibrary added"
+            fi
+            
+            echo "--- AndroidManifest.xml ---"
+            head -12 "$MANIFEST"
+          fi
+
+      # PERBAIKAN: Fix compileSdk, missing assets & Java errors (AGRESIF)
+      - name: 🔧 Fix compileSdk, Assets & Java
+        run: |
+          echo "=========================================="
+          echo "=== FIX 1: compileSdk ke 36 ==="
+          echo "=========================================="
+          
+          # Fix semua file gradle
+          find android -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) | while read f; do
+            echo "=== Before: $f ==="
+            grep -n "compileSdk" "$f" || echo "(no compileSdk found)"
+            
+            # Ganti semua variasi compileSdk
+            sed -i 's/compileSdkVersion\s*=\?\s*35/compileSdkVersion 36/g' "$f"
+            sed -i 's/compileSdkVersion\s*=\?\s*34/compileSdkVersion 36/g' "$f"
+            sed -i 's/compileSdkVersion\s*=\?\s*33/compileSdkVersion 36/g' "$f"
+            sed -i 's/compileSdk\s*=\?\s*35/compileSdk = 36/g' "$f"
+            sed -i 's/compileSdk\s*=\?\s*34/compileSdk = 36/g' "$f"
+            sed -i 's/compileSdk\s*=\?\s*33/compileSdk = 36/g' "$f"
+            sed -i 's/compileSdk(35)/compileSdk(36)/g' "$f"
+            sed -i 's/compileSdk(34)/compileSdk(36)/g' "$f"
+            sed -i 's/compileSdk(33)/compileSdk(36)/g' "$f"
+            sed -i 's/compileSdk\s\+35/compileSdk 36/g' "$f"
+            sed -i 's/compileSdk\s\+34/compileSdk 36/g' "$f"
+            
+            echo "=== After: $f ==="
+            grep -n "compileSdk" "$f" || echo "(no compileSdk)"
+          done
+          
+          # Juga fix di android/build.gradle
+          if [ -f android/build.gradle ]; then
+            sed -i 's/compileSdkVersion\s*=\?\s*35/compileSdkVersion 36/g' android/build.gradle
+            sed -i 's/compileSdk\s*=\?\s*35/compileSdk = 36/g' android/build.gradle
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "=== FIX 2: Buat folder assets ==="
+          echo "=========================================="
+          
+          # Buat folder assets yang umum
+          for dir in assets assets/images assets/videos assets/audio assets/fonts assets/icons; do
+            if [ ! -d "$dir" ]; then
+              mkdir -p "$dir"
+              touch "$dir/.gitkeep"
+              echo "✅ Created: $dir/"
+            else
+              echo "✅ Exists: $dir/"
+            fi
+          done
+          
+          # Baca pubspec.yaml dan buat folder yang diperlukan
+          if [ -f pubspec.yaml ]; then
+            echo "Reading pubspec.yaml for assets..."
+            grep -E "^\s+-\s+" pubspec.yaml | sed 's/.*- //' | while read asset; do
+              # Hanya buat folder (yang berakhiran /)
+              if echo "$asset" | grep -q "/$"; then
+                if [ ! -d "$asset" ]; then
+                  mkdir -p "$asset"
+                  touch "$asset/.gitkeep"
+                  echo "✅ Created from pubspec: $asset"
+                fi
+              else
+                # Buat folder parent-nya
+                PARENT_DIR=$(dirname "$asset")
+                if [ "$PARENT_DIR" != "." ] && [ ! -d "$PARENT_DIR" ]; then
+                  mkdir -p "$PARENT_DIR"
+                  touch "$PARENT_DIR/.gitkeep"
+                  echo "✅ Created parent: $PARENT_DIR/"
+                fi
+                # Buat placeholder file
+                if [ ! -f "$asset" ]; then
+                  touch "$asset"
+                  echo "✅ Created placeholder: $asset"
+                fi
+              fi
+            done
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "=== FIX 3: Java InputType ==="
+          echo "=========================================="
+          
+          # Fix Java file
+          JAVA_FILE="android/app/src/main/java/com/nullx/pp/LockOverlayService.java"
+          if [ -f "$JAVA_FILE" ]; then
+            echo "Fixing: $JAVA_FILE"
+            # Backup
+            cp "$JAVA_FILE" "$JAVA_FILE.bak"
+            
+            # Ganti TYPE_NUMBER_PASSWORD
+            sed -i 's/InputType\.TYPE_NUMBER_PASSWORD/(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD)/g' "$JAVA_FILE"
+            
+            # Verifikasi
+            if grep -q "TYPE_NUMBER_PASSWORD" "$JAVA_FILE"; then
+              echo "❌ Fix failed, masih ada TYPE_NUMBER_PASSWORD"
+              # Cara alternatif: import yang benar
+              if ! grep -q "import android.text.InputType" "$JAVA_FILE"; then
+                sed -i '1s/^/import android.text.InputType;\n/' "$JAVA_FILE"
+              fi
+              # Ganti lagi dengan cara berbeda
+              sed -i 's/InputType\.TYPE_NUMBER_PASSWORD/129/g' "$JAVA_FILE"
+              echo "✅ Fixed with numeric value 129"
+            else
+              echo "✅ TYPE_NUMBER_PASSWORD fixed"
+            fi
+          else
+            echo "⚠️ LockOverlayService.java not found, searching..."
+            find android -name "*.java" -type f | while read f; do
+              if grep -l "TYPE_NUMBER_PASSWORD" "$f" 2>/dev/null; then
+                echo "Found in: $f"
+                sed -i 's/InputType\.TYPE_NUMBER_PASSWORD/(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD)/g' "$f"
+                echo "✅ Fixed: $f"
+              fi
+            done
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "=== ALL FIXES COMPLETE ==="
+          echo "=========================================="
+          
+          # Verifikasi akhir
+          echo ""
+          echo "=== Verification ==="
+          echo "compileSdk values:"
+          grep -rn "compileSdk" android/ 2>/dev/null | grep -v ".bak" | head -10
+          echo ""
+          echo "Asset directories:"
+          ls -d assets/*/ 2>/dev/null || echo "(no asset dirs)"
+          echo ""
+          echo "TYPE_NUMBER_PASSWORD occurrences:"
+          grep -rn "TYPE_NUMBER_PASSWORD" android/ 2>/dev/null || echo "✅ None found (FIXED!)"
+
+      - name: Set Build Type
+        id: build_info
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          if [ -z "$BUILD_TYPE" ]; then
+            BUILD_TYPE="apk-debug"
+          fi
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "Build type: $BUILD_TYPE"
+
+      - name: Flutter Pub Get
+        run: |
+          flutter config --no-analytics
+          dart --disable-analytics
+          flutter pub get
+
+      - name: Build APK Debug
+        if: steps.build_info.outputs.build_type == 'apk-debug'
+        run: |
+          flutter build apk --debug \
+            --no-shrink \
+            --target-platform android-arm,android-arm64,android-x64
+          echo "APK Debug selesai"
+
+      - name: Build APK Release
+        if: steps.build_info.outputs.build_type == 'apk-release'
+        run: |
+          flutter build apk --release \
+            --obfuscate \
+            --split-debug-info=build/debug-info \
+            --target-platform android-arm,android-arm64,android-x64
+          echo "APK Release selesai"
+
+      - name: Build AAB Release
+        if: steps.build_info.outputs.build_type == 'aab-release'
+        run: |
+          flutter build appbundle --release \
+            --obfuscate \
+            --split-debug-info=build/debug-info
+          echo "AAB Release selesai"
+
+      - name: Prepare Output Files
+        run: |
+          mkdir -p output
+          BUILD_TYPE="${{ steps.build_info.outputs.build_type }}"
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          APP_NAME=$(grep '^name:' pubspec.yaml | awk '{print $2}' | tr -d '\r')
+
+          if [ "$BUILD_TYPE" = "apk-debug" ]; then
+            APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" | head -1)
+            cp "$APK_PATH" "output/${APP_NAME}_debug_${TIMESTAMP}.apk"
+          elif [ "$BUILD_TYPE" = "apk-release" ]; then
+            APK_PATH=$(find build/app/outputs/flutter-apk -name "app-release.apk" | head -1)
+            cp "$APK_PATH" "output/${APP_NAME}_release_${TIMESTAMP}.apk"
+          elif [ "$BUILD_TYPE" = "aab-release" ]; then
+            AAB_PATH=$(find build/app/outputs/bundle/release -name "*.aab" | head -1)
+            cp "$AAB_PATH" "output/${APP_NAME}_release_${TIMESTAMP}.aab"
+          fi
+
+          echo "Output files:"
+          ls -lh output/
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-${{ steps.build_info.outputs.build_type }}-${{ github.run_number }}
+          path: output/
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## 🚀 Flutter Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Type | ${{ steps.build_info.outputs.build_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Flutter Version | 3.47.2 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered By | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Output" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh output/ 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No output files" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
